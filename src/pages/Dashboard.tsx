@@ -6,11 +6,12 @@ import Button from '../components/UI/Button';
 import type { User, Field } from '../types';
 import { supabase } from '../lib/supabaseClient';
 import { useAuth } from '../contexts/AuthContext';
+import { orchardService } from '../services/orchardService';
 
 const Dashboard: React.FC = () => {
   const navigate = useNavigate();
   const mapRef = useRef<HTMLDivElement>(null);
-  const mapInstanceRef = useRef<any>(null);
+  const mapInstanceRef = useRef<L.Map | null>(null);
   const [mapsLoaded, setMapsLoaded] = useState(false);
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
   const [fields, setFields] = useState<Field[]>([]);
@@ -18,6 +19,7 @@ const Dashboard: React.FC = () => {
   const [fieldsError, setFieldsError] = useState<string | null>(null);
   const [activities, setActivities] = useState<Array<{ id: string; title: string; createdAt: string; kind: 'success' | 'warning' | 'info' }>>([]);
   const [activityError, setActivityError] = useState<string | null>(null);
+  const [orchardData, setOrchardData] = useState<{ [fieldId: string]: { varieties: any[], treeTags: any[] } }>({});
   const { user, session } = useAuth();
 
   const profileUser: User = user ?? {
@@ -49,26 +51,27 @@ const Dashboard: React.FC = () => {
   const profileCompletion = calculateProfileCompletion(profileUser);
 
   useEffect(() => {
-    const loadGoogleMaps = () => {
-      const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
-      if (!apiKey) {
-        return;
+    const loadTomorrowMaps = () => {
+      // Load Leaflet CSS
+      if (!document.querySelector('link[href*="leaflet"]')) {
+        const leafletCSS = document.createElement('link');
+        leafletCSS.rel = 'stylesheet';
+        leafletCSS.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        document.head.appendChild(leafletCSS);
       }
 
-      if ((window as any).google?.maps) {
+      // Load Leaflet JS
+      if (!(window as any).L) {
+        const leafletJS = document.createElement('script');
+        leafletJS.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+        leafletJS.onload = () => setMapsLoaded(true);
+        document.head.appendChild(leafletJS);
+      } else {
         setMapsLoaded(true);
-        return;
       }
-
-      const script = document.createElement('script');
-      script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=geometry,drawing`;
-      script.async = true;
-      script.defer = true;
-      script.onload = () => setMapsLoaded(true);
-      document.head.appendChild(script);
     };
 
-    loadGoogleMaps();
+    loadTomorrowMaps();
   }, []);
 
   useEffect(() => {
@@ -111,6 +114,28 @@ const Dashboard: React.FC = () => {
 
       setFields(mappedFields);
       setLoadingFields(false);
+
+      // Load orchard data for each field
+      const orchardDataPromises = mappedFields.map(async (field) => {
+        try {
+          const [varieties, treeTags] = await Promise.all([
+            orchardService.variety.getOrchardVarieties(session.user.id, field.id),
+            orchardService.treeTag.getTreeTags(session.user.id, field.id)
+          ]);
+          return { fieldId: field.id, varieties, treeTags };
+        } catch (error) {
+          console.error(`Error loading orchard data for field ${field.id}:`, error);
+          return { fieldId: field.id, varieties: [], treeTags: [] };
+        }
+      });
+
+      Promise.all(orchardDataPromises).then((results) => {
+        const orchardDataMap = results.reduce((acc, { fieldId, varieties, treeTags }) => {
+          acc[fieldId] = { varieties, treeTags };
+          return acc;
+        }, {} as { [fieldId: string]: { varieties: any[], treeTags: any[] } });
+        setOrchardData(orchardDataMap);
+      });
     };
 
     loadFields();
@@ -152,13 +177,15 @@ const Dashboard: React.FC = () => {
   }, [session?.user]);
 
   useEffect(() => {
-    if (!mapsLoaded || !mapRef.current || fields.length === 0) {
+    if (!mapsLoaded || !mapRef.current || fields.length === 0 || !(window as any).L) {
       return;
     }
 
-    const googleMaps = (window as any).google;
-    if (!googleMaps?.maps) {
-      return;
+    const L = (window as any).L;
+    
+    // Clear existing map
+    if (mapInstanceRef.current) {
+      mapInstanceRef.current.remove();
     }
 
     // Calculate center based on all fields
@@ -170,49 +197,204 @@ const Dashboard: React.FC = () => {
     const avgLat = fieldsWithCoords.reduce((sum, f) => sum + (f.latitude || 0), 0) / fieldsWithCoords.length;
     const avgLng = fieldsWithCoords.reduce((sum, f) => sum + (f.longitude || 0), 0) / fieldsWithCoords.length;
 
-    const map = new googleMaps.maps.Map(mapRef.current, {
-      center: { lat: avgLat, lng: avgLng },
-      zoom: 12,
-      mapTypeId: 'satellite',
-    });
+    // Initialize Leaflet map
+    const map = L.map(mapRef.current).setView([avgLat, avgLng], 12);
+
+    // Add Tomorrow.ai satellite layer
+    const tomorrowApiKey = '43EFDUKlRuMKRQRdJIVfABgN3pVbsWK7z';
+    L.tileLayer(`https://api.tomorrow.io/v4/map/tile/{z}/{x}/{y}/satellite/recent.png?apikey=${tomorrowApiKey}`, {
+      attribution: '© Tomorrow.io',
+      maxZoom: 18,
+    }).addTo(map);
 
     mapInstanceRef.current = map;
 
-    // Add markers for all fields
+    // Define variety colors
+    const varietyColors: { [key: string]: string } = {
+      'Red Delicious / Delicious': '#dc2626', // red-600
+      'Kashmir Golden / Golden Delicious': '#f59e0b', // amber-500
+      'Ambri': '#7c3aed', // violet-600
+      'Gala Scarlet / Redlum Gala': '#ef4444', // red-500
+      'Auvi Fuji': '#06b6d4', // cyan-500
+      'Scarlet Spur-II': '#ec4899', // pink-500
+      'Super Chief': '#10b981', // emerald-500
+      'default': '#6b7280' // gray-500
+    };
+
+    // Add field boundaries and tree visualization
     fieldsWithCoords.forEach((field) => {
-      const marker = new googleMaps.maps.Marker({
-        position: { lat: field.latitude!, lng: field.longitude! },
-        map,
-        title: field.name,
-        label: {
-          text: field.name.charAt(0),
-          color: 'white',
-          fontSize: '14px',
-          fontWeight: 'bold',
-        },
-      });
+      const fieldOrchardData = orchardData[field.id];
+      
+      // Add field boundary if available
+      if (field.boundaryPath && field.boundaryPath.length > 0) {
+        const boundaryCoords = field.boundaryPath.map((point: any) => [point.lat, point.lng]);
+        const polygon = L.polygon(boundaryCoords, {
+          color: '#059669', // emerald-600
+          weight: 2,
+          fillOpacity: 0.1,
+          fillColor: '#10b981' // emerald-500
+        }).addTo(map);
 
-      const infoWindow = new googleMaps.maps.InfoWindow({
-        content: `
-          <div style="padding: 8px;">
-            <h3 style="font-weight: 600; margin-bottom: 4px;">${field.name}</h3>
-            <p style="font-size: 12px; color: #666;">Area: ${field.area} kanal</p>
-            <p style="font-size: 12px; color: #666;">Status: ${field.healthStatus}</p>
+        polygon.bindPopup(`
+          <div style="padding: 8px; min-width: 200px;">
+            <h3 style="font-weight: 600; margin-bottom: 8px; color: #1f2937;">${field.name}</h3>
+            <div style="font-size: 12px; color: #6b7280; margin-bottom: 8px;">
+              <div><strong>Area:</strong> ${field.area} kanal</div>
+              <div><strong>Status:</strong> ${field.healthStatus}</div>
+              <div><strong>Stage:</strong> ${field.cropStage}</div>
+            </div>
+            ${fieldOrchardData ? `
+              <div style="font-size: 11px; color: #4b5563;">
+                <div><strong>Varieties:</strong> ${fieldOrchardData.varieties.length}</div>
+                <div><strong>Tagged Trees:</strong> ${fieldOrchardData.treeTags.length}</div>
+              </div>
+            ` : ''}
           </div>
-        `,
-      });
+        `);
+      }
 
-      marker.addListener('click', () => {
+      // Add center marker for field
+      const marker = L.circleMarker([field.latitude!, field.longitude!], {
+        radius: 8,
+        fillColor: '#059669',
+        color: '#ffffff',
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 0.8
+      }).addTo(map);
+
+      marker.bindPopup(`
+        <div style="padding: 8px; min-width: 200px;">
+          <h3 style="font-weight: 600; margin-bottom: 8px; color: #1f2937;">${field.name}</h3>
+          <div style="font-size: 12px; color: #6b7280;">
+            <div>Area: ${field.area} kanal</div>
+            <div>Status: ${field.healthStatus}</div>
+          </div>
+        </div>
+      `);
+
+      // Add tree tags with variety-based colors
+      if (fieldOrchardData && fieldOrchardData.treeTags.length > 0) {
+        fieldOrchardData.treeTags.forEach((tree: any) => {
+          const varietyColor = varietyColors[tree.variety] || varietyColors.default;
+          
+          const treeMarker = L.circleMarker([tree.latitude, tree.longitude], {
+            radius: 4,
+            fillColor: varietyColor,
+            color: '#ffffff',
+            weight: 1,
+            opacity: 1,
+            fillOpacity: 0.9
+          }).addTo(map);
+
+          treeMarker.bindPopup(`
+            <div style="padding: 6px; min-width: 150px;">
+              <h4 style="font-weight: 600; margin-bottom: 4px; color: #1f2937;">${tree.name}</h4>
+              <div style="font-size: 11px; color: #6b7280;">
+                <div><strong>Variety:</strong> ${tree.variety}</div>
+                <div><strong>Row:</strong> ${tree.rowNumber}</div>
+                <div><strong>Health:</strong> ${tree.healthStatus}</div>
+              </div>
+            </div>
+          `);
+        });
+      }
+
+      // Visualize tree rows based on orchard details
+      if (field.boundaryPath && field.boundaryPath.length > 0) {
+        try {
+          const details = typeof field.details === 'string' ? JSON.parse(field.details) : field.details;
+          if (details && details.numberOfRows && details.treesPerRow) {
+            const numberOfRows = parseInt(details.numberOfRows);
+            const treesPerRow = parseInt(details.treesPerRow);
+            
+            if (numberOfRows > 0 && treesPerRow > 0) {
+              // Calculate row positions within boundary
+              const boundary = field.boundaryPath;
+              const minLat = Math.min(...boundary.map((p: any) => p.lat));
+              const maxLat = Math.max(...boundary.map((p: any) => p.lat));
+              const minLng = Math.min(...boundary.map((p: any) => p.lng));
+              const maxLng = Math.max(...boundary.map((p: any) => p.lng));
+              
+              const latStep = (maxLat - minLat) / (numberOfRows + 1);
+              const lngStep = (maxLng - minLng) / (treesPerRow + 1);
+              
+              // Draw tree rows
+              for (let row = 1; row <= numberOfRows; row++) {
+                const rowLat = minLat + (row * latStep);
+                
+                // Draw row line
+                const rowLine = L.polyline([
+                  [rowLat, minLng + lngStep],
+                  [rowLat, maxLng - lngStep]
+                ], {
+                  color: '#9ca3af',
+                  weight: 1,
+                  opacity: 0.6,
+                  dashArray: '5, 5'
+                }).addTo(map);
+                
+                // Add tree positions along the row
+                for (let tree = 1; tree <= treesPerRow; tree++) {
+                  const treeLng = minLng + (tree * lngStep);
+                  
+                  // Get variety for this position (if available from varietyTrees data)
+                  let treeVariety = 'Unknown';
+                  let varietyColor = varietyColors.default;
+                  
+                  if (details.varietyTrees && details.varietyTrees.length > 0) {
+                    const totalTrees = details.varietyTrees.reduce((sum: number, v: any) => sum + parseInt(v.totalTrees || 0), 0);
+                    const currentTreeIndex = ((row - 1) * treesPerRow) + tree - 1;
+                    
+                    let runningTotal = 0;
+                    for (const varietyData of details.varietyTrees) {
+                      runningTotal += parseInt(varietyData.totalTrees || 0);
+                      if (currentTreeIndex < runningTotal) {
+                        treeVariety = varietyData.variety;
+                        varietyColor = varietyColors[treeVariety] || varietyColors.default;
+                        break;
+                      }
+                    }
+                  }
+                  
+                  const treeMarker = L.circleMarker([rowLat, treeLng], {
+                    radius: 2,
+                    fillColor: varietyColor,
+                    color: varietyColor,
+                    weight: 1,
+                    opacity: 0.8,
+                    fillOpacity: 0.8
+                  }).addTo(map);
+                  
+                  treeMarker.bindPopup(`
+                    <div style="padding: 4px; min-width: 120px;">
+                      <div style="font-size: 11px; color: #1f2937;">
+                        <div><strong>Row:</strong> ${row}</div>
+                        <div><strong>Position:</strong> ${tree}</div>
+                        <div><strong>Variety:</strong> ${treeVariety}</div>
+                      </div>
+                    </div>
+                  `);
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Error parsing field details:', error);
+        }
+      }
+
+      // Handle field selection
+      marker.on('click', () => {
         setSelectedFieldId(field.id);
-        infoWindow.open(map, marker);
       });
     });
-  }, [mapsLoaded, fields]);
+
+  }, [mapsLoaded, fields, orchardData]);
 
   const handleViewField = (field: Field) => {
     if (field.latitude && field.longitude && mapInstanceRef.current) {
-      mapInstanceRef.current.panTo({ lat: field.latitude, lng: field.longitude });
-      mapInstanceRef.current.setZoom(16);
+      mapInstanceRef.current.setView([field.latitude, field.longitude], 16);
       setSelectedFieldId(field.id);
     }
   };
@@ -333,11 +515,6 @@ const Dashboard: React.FC = () => {
                   ref={mapRef}
                   className="w-full h-96 rounded-lg border border-gray-200 bg-gray-100"
                 />
-                {!import.meta.env.VITE_GOOGLE_API_KEY && (
-                  <div className="absolute inset-0 flex items-center justify-center bg-gray-100 rounded-lg">
-                    <p className="text-sm text-gray-500">Map requires Google Maps API key</p>
-                  </div>
-                )}
               </>
             )}
           </div>
@@ -399,6 +576,32 @@ const Dashboard: React.FC = () => {
           </div>
         </div>
       </Card>
+
+      {/* Variety Legend */}
+      {Object.keys(orchardData).length > 0 && (
+        <Card className="p-4">
+          <h3 className="text-sm font-semibold text-gray-700 mb-3">Apple Variety Legend</h3>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 text-xs">
+            {Object.entries({
+              'Red Delicious / Delicious': '#dc2626',
+              'Kashmir Golden / Golden Delicious': '#f59e0b',
+              'Ambri': '#7c3aed',
+              'Gala Scarlet / Redlum Gala': '#ef4444',
+              'Auvi Fuji': '#06b6d4',
+              'Scarlet Spur-II': '#ec4899',
+              'Super Chief': '#10b981'
+            }).map(([variety, color]) => (
+              <div key={variety} className="flex items-center gap-2">
+                <div 
+                  className="w-3 h-3 rounded-full border border-white"
+                  style={{ backgroundColor: color }}
+                />
+                <span className="text-gray-600 truncate">{variety}</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
 
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
