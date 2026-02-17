@@ -1,0 +1,169 @@
+-- Enable extensions
+create extension if not exists "pgcrypto";
+
+-- PROFILES TABLE
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  name text,
+  email text,
+  phone text,
+  farm_name text,
+  avatar_url text,
+  khasra_number text,
+  khata_number text,
+  whatsapp text,
+  address text,
+  language text,
+  currency text,
+  created_at timestamptz not null default now()
+);
+
+alter table public.profiles enable row level security;
+
+create policy "profiles_select_own"
+  on public.profiles
+  for select
+  using (auth.uid() = id);
+
+create policy "profiles_insert_own"
+  on public.profiles
+  for insert
+  with check (auth.uid() = id);
+
+create policy "profiles_update_own"
+  on public.profiles
+  for update
+  using (auth.uid() = id);
+
+-- FIELDS TABLE
+create table if not exists public.fields (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null,
+  area numeric,
+  soil_type text,
+  crop_stage text,
+  health_status text,
+  location text,
+  planted_date date,
+  latitude double precision,
+  longitude double precision,
+  boundary_path jsonb,
+  details jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists fields_user_id_idx on public.fields(user_id);
+
+alter table public.fields enable row level security;
+
+create policy "fields_select_own"
+  on public.fields
+  for select
+  using (auth.uid() = user_id);
+
+create policy "fields_insert_own"
+  on public.fields
+  for insert
+  with check (auth.uid() = user_id);
+
+create policy "fields_update_own"
+  on public.fields
+  for update
+  using (auth.uid() = user_id);
+
+create policy "fields_delete_own"
+  on public.fields
+  for delete
+  using (auth.uid() = user_id);
+
+-- ACTIVITIES TABLE
+create table if not exists public.activities (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  title text not null,
+  kind text default 'info',
+  created_at timestamptz not null default now()
+);
+
+create index if not exists activities_user_id_idx on public.activities(user_id);
+
+alter table public.activities enable row level security;
+
+create policy "activities_select_own"
+  on public.activities
+  for select
+  using (auth.uid() = user_id);
+
+create policy "activities_insert_own"
+  on public.activities
+  for insert
+  with check (auth.uid() = user_id);
+
+create policy "activities_update_own"
+  on public.activities
+  for update
+  using (auth.uid() = user_id);
+
+create policy "activities_delete_own"
+  on public.activities
+  for delete
+  using (auth.uid() = user_id);
+
+-- AVATARS BUCKET
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true)
+on conflict (id) do nothing;
+
+-- STORAGE POLICIES FOR AVATARS
+create policy "avatars_read_public"
+  on storage.objects
+  for select
+  using (bucket_id = 'avatars');
+
+create policy "avatars_insert_own"
+  on storage.objects
+  for insert
+  with check (bucket_id = 'avatars' and auth.uid() = owner);
+
+create policy "avatars_update_own"
+  on storage.objects
+  for update
+  using (bucket_id = 'avatars' and auth.uid() = owner);
+
+create policy "avatars_delete_own"
+  on storage.objects
+  for delete
+  using (bucket_id = 'avatars' and auth.uid() = owner);
+
+-- AUTO-PROFILE TRIGGER
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.profiles (
+    id,
+    email,
+    name,
+    phone
+  )
+  values (
+    new.id,
+    new.email,
+    coalesce(new.raw_user_meta_data->>'name', ''),
+    coalesce(new.raw_user_meta_data->>'phone', '')
+  )
+  on conflict (id) do nothing;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
