@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Plus, Search, ListFilter as Filter, MapPin, X } from 'lucide-react';
 import Card from '../components/UI/Card';
 import Button from '../components/UI/Button';
@@ -65,9 +66,14 @@ const highDensityVarieties: AppleVariety[] = [
   { name: 'Pink Lady', role: 'main', description: '🌳 Main (needs pollinator)' },
 ];
 
-type VarietyTreeRow = {
+type VarietyInRow = {
   variety: string;
-  totalTrees: string;
+  trees: string;
+};
+
+type OrchardRow = {
+  rowId: string;
+  varieties: VarietyInRow[];
 };
 
 type TreeTag = {
@@ -83,12 +89,9 @@ type OrchardForm = {
   name: string;
   orchardType: string;
   areaKanal: string;
-  totalTrees: string;
-  numberOfRows: string;
-  treesPerRow: string;
   ageYears: string;
   pollinatorType: string;
-  varietyTrees: VarietyTreeRow[];
+  rows: OrchardRow[];
   soilType: string;
   unknownSoil: boolean;
   pincode: string;
@@ -110,12 +113,9 @@ const createInitialForm = (): OrchardForm => ({
   name: '',
   orchardType: '',
   areaKanal: '',
-  totalTrees: '',
-  numberOfRows: '',
-  treesPerRow: '',
   ageYears: '',
   pollinatorType: '',
-  varietyTrees: [{ variety: '', totalTrees: '' }],
+  rows: [{ rowId: '1', varieties: [{ variety: '', trees: '' }] }],
   soilType: '',
   unknownSoil: false,
   pincode: '',
@@ -135,6 +135,7 @@ const createInitialForm = (): OrchardForm => ({
 
 const Fields = () => {
   const { session } = useAuth();
+  const navigate = useNavigate();
   const [searchTerm, setSearchTerm] = useState('');
   const [fields, setFields] = useState<Field[]>([]);
   const [fieldsLoading, setFieldsLoading] = useState(false);
@@ -143,6 +144,7 @@ const Fields = () => {
   const [wizardStep, setWizardStep] = useState(1);
   const [soilGuideOpen, setSoilGuideOpen] = useState(false);
   const [formData, setFormData] = useState<OrchardForm>(createInitialForm());
+  const [editingFieldId, setEditingFieldId] = useState<string | null>(null);
   const [pincodeLoading, setPincodeLoading] = useState(false);
   const [pincodeError, setPincodeError] = useState<string | null>(null);
   const [mapsLoaded, setMapsLoaded] = useState(false);
@@ -164,8 +166,11 @@ const Fields = () => {
   const drawingManagerRef = useRef<any>(null);
   const kmlLayerRef = useRef<any>(null);
   const kmlObjectUrlRef = useRef<string | null>(null);
+  const kmlPolygonsRef = useRef<any[]>([]);
   const treeMarkersRef = useRef<any[]>([]);
   const taggingModeRef = useRef(false);
+  const temporaryOutsideMarkersRef = useRef<any[]>([]);
+  const boundaryPathRef = useRef<Array<{ lat: number; lng: number }>>([]);
 
   const apiKey =
     (import.meta.env.VITE_GOOGLE_API_KEY as string | undefined) || '';
@@ -196,6 +201,27 @@ const Fields = () => {
 
   const getPollinatorsForOrchard = (): AppleVariety[] => {
     return getAvailableVarieties().filter((v) => v.role === 'pollinator' || v.role === 'both');
+  };
+
+  // Utility function to check if a point is inside a polygon using ray casting algorithm
+  const isPointInPolygon = (point: { lat: number; lng: number }, polygon: Array<{ lat: number; lng: number }>): boolean => {
+    if (!polygon || polygon.length < 3) return false;
+
+    let inside = false;
+    const x = point.lng;
+    const y = point.lat;
+
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i].lng;
+      const yi = polygon[i].lat;
+      const xj = polygon[j].lng;
+      const yj = polygon[j].lat;
+
+      const intersect = ((yi > y) !== (yj > y)) && (x < ((xj - xi) * (y - yi)) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+
+    return inside;
   };
 
   const getHealthStatusColor = (status: string) => {
@@ -232,6 +258,17 @@ const Fields = () => {
   }, [taggingMode]);
 
   useEffect(() => {
+    boundaryPathRef.current = formData.boundaryPath || [];
+  }, [formData.boundaryPath]);
+
+  // When tagging mode is enabled, disable drawing mode to allow tree tagging
+  useEffect(() => {
+    if (taggingMode && drawingManagerRef.current) {
+      drawingManagerRef.current.setDrawingMode(null);
+    }
+  }, [taggingMode]);
+
+  useEffect(() => {
     const loadFields = async () => {
       if (!session?.user) {
         setFields([]);
@@ -245,7 +282,7 @@ const Fields = () => {
       const { data, error } = await supabase
         .from('fields')
         .select(
-          'id, name, area, soil_type, crop_stage, health_status, location, planted_date, latitude, longitude, boundary_path'
+          'id, name, area, soil_type, crop_stage, health_status, location, planted_date, latitude, longitude, boundary_path, details'
         )
         .eq('user_id', session.user.id);
 
@@ -267,6 +304,7 @@ const Fields = () => {
         latitude: row.latitude ?? undefined,
         longitude: row.longitude ?? undefined,
         boundaryPath: row.boundary_path ?? undefined,
+        details: row.details ?? undefined,
       }));
 
       setFields(mappedFields);
@@ -382,27 +420,78 @@ const Fields = () => {
 
     mapInstanceRef.current = map;
 
-    if (formData.latitude && formData.longitude) {
-      markerRef.current = new googleMaps.maps.Marker({
-        position: { lat: formData.latitude, lng: formData.longitude },
-        map,
-      });
-    }
+    // Don't show a pinned marker - only boundary drawing allowed
+    // Markers will only appear for trees during tagging mode
 
-    map.addListener('click', (event: any) => {
-      const position = event?.latLng;
-      if (!position) {
-        return;
-      }
+    // Store click handler function for cleanup if needed
+    const handleMapClick = (event: any) => {
+      try {
+        const position = event?.latLng;
+        if (!position) {
+          return;
+        }
 
-      if (taggingModeRef.current) {
-        setPendingTagLocation({ lat: position.lat(), lng: position.lng() });
+        // Only process clicks in tagging mode
+        if (!taggingModeRef.current) {
+          return;
+        }
+
+        const clickedPoint = {
+          lat: position.lat(),
+          lng: position.lng(),
+        };
+
+        console.log('Click detected at:', clickedPoint);
+        console.log('Tagging mode:', taggingModeRef.current);
+        console.log('Boundary path:', boundaryPathRef.current.length > 0 ? 'exists' : 'empty');
+
+        // If boundary exists, check if point is inside
+        if (boundaryPathRef.current && boundaryPathRef.current.length > 0) {
+          const isInside = isPointInPolygon(clickedPoint, boundaryPathRef.current);
+          console.log('Point inside boundary:', isInside);
+
+          if (!isInside) {
+            // Show temporary red dot for outside click
+            const googleMaps = (window as any).google;
+            if (googleMaps?.maps && mapInstanceRef.current) {
+              const tempMarker = new googleMaps.maps.Marker({
+                position: clickedPoint,
+                map: mapInstanceRef.current,
+                title: 'Outside boundary - trees can only be tagged inside',
+                icon: {
+                  path: googleMaps.maps.SymbolPath.CIRCLE,
+                  scale: 8,
+                  fillColor: '#ff0000',
+                  fillOpacity: 0.8,
+                  strokeColor: '#ffffff',
+                  strokeWeight: 2,
+                },
+              });
+
+              temporaryOutsideMarkersRef.current.push(tempMarker);
+
+              // Remove marker after 2 seconds
+              setTimeout(() => {
+                tempMarker.setMap(null);
+                temporaryOutsideMarkersRef.current = temporaryOutsideMarkersRef.current.filter(
+                  (m) => m !== tempMarker
+                );
+              }, 2000);
+            }
+            return;
+          }
+        }
+
+        // Point is inside boundary or no boundary exists - open tag form
+        console.log('Opening tag form for point:', clickedPoint);
+        setPendingTagLocation(clickedPoint);
         setTagFormOpen(true);
-        return;
+      } catch (error) {
+        console.error('Error in map click handler:', error);
       }
+    };
 
-      updatePinnedLocation(position.lat(), position.lng());
-    });
+    map.addListener('click', handleMapClick);
 
     const drawingManager = new googleMaps.maps.drawing.DrawingManager({
       drawingMode: null,
@@ -432,7 +521,9 @@ const Fields = () => {
         return;
       }
       navigator.geolocation.getCurrentPosition((position) => {
-        updatePinnedLocation(position.coords.latitude, position.coords.longitude);
+        // Auto detect just centers the map, doesn't set pinned location
+        mapInstanceRef.current?.panTo({ lat: position.coords.latitude, lng: position.coords.longitude });
+        mapInstanceRef.current?.setZoom(13);
       });
     };
     map.controls[googleMaps.maps.ControlPosition.TOP_RIGHT].push(autoDetectButton);
@@ -462,12 +553,7 @@ const Fields = () => {
         mapAreaKanal: Number(areaKanal.toFixed(2)),
       }));
 
-      // Add click listener to polygon
-      googleMaps.maps.event.addListener(event.overlay, 'click', (clickEvent: any) => {
-        const clickedLat = clickEvent.latLng.lat();
-        const clickedLng = clickEvent.latLng.lng();
-        alert(`Boundary clicked at: ${clickedLat.toFixed(5)}, ${clickedLng.toFixed(5)}\n\nBoundary has ${points.length} points and covers ${areaKanal.toFixed(2)} kanal`);
-      });
+      // Don't add click listener to polygon - just close drawing mode
     });
 
     if (kmlObjectUrlRef.current) {
@@ -545,6 +631,7 @@ const Fields = () => {
     setWizardStep(1);
     setSoilGuideOpen(false);
     setFormData(createInitialForm());
+    setEditingFieldId(null);
     setPincodeError(null);
     setMapsError(null);
     setMapsLoaded(false);
@@ -571,11 +658,106 @@ const Fields = () => {
     }
     treeMarkersRef.current.forEach((marker) => marker.setMap(null));
     treeMarkersRef.current = [];
+    temporaryOutsideMarkersRef.current.forEach((marker) => marker.setMap(null));
+    temporaryOutsideMarkersRef.current = [];
+    boundaryPathRef.current = [];
   };
 
   const openWizard = () => {
+    setEditingFieldId(null);
     setWizardOpen(true);
     setWizardStep(1);
+  };
+
+  const populateFormForEdit = (field: Field) => {
+    // If the field has details saved, prefer them to populate the form
+    const details = (field as any).details ?? null;
+    if (details) {
+      // merge known top-level fields with details
+      setFormData((prev) => ({ ...prev, ...(details as OrchardForm) }));
+    } else {
+      // fallback: map available top-level fields
+      setFormData((prev) => ({
+        ...prev,
+        name: field.name || prev.name,
+        areaKanal: field.area?.toString() ?? prev.areaKanal,
+        latitude: field.latitude ?? prev.latitude,
+        longitude: field.longitude ?? prev.longitude,
+        boundaryPath: field.boundaryPath ?? prev.boundaryPath,
+      }));
+    }
+  };
+
+  const openWizardForEdit = (field: Field) => {
+    setEditingFieldId(field.id);
+    populateFormForEdit(field);
+    setWizardOpen(true);
+    setWizardStep(1);
+  };
+
+  const handleUpdateField = async () => {
+    if (!session?.user || !editingFieldId) return;
+
+    setFieldsError(null);
+
+    // Calculate field coordinates from boundary center if boundary exists, otherwise keep existing
+    let fieldLat = formData.latitude ?? 31.5204;
+    let fieldLng = formData.longitude ?? 74.3587;
+    
+    if (formData.boundaryPath && formData.boundaryPath.length > 0) {
+      const center = calculateBoundaryCenter(formData.boundaryPath);
+      if (center) {
+        fieldLat = center.lat;
+        fieldLng = center.lng;
+      }
+    }
+
+    const payload = {
+      name: formData.name || 'Orchard',
+      area: Number(formData.areaKanal) || 0,
+      soil_type: formData.soilType || 'Unknown',
+      crop_stage: 'Growing',
+      health_status: 'Good',
+      location: formData.district || formData.zone || 'Unknown',
+      planted_date: new Date().toISOString().slice(0, 10),
+      latitude: fieldLat,
+      longitude: fieldLng,
+      boundary_path: formData.boundaryPath.length > 0 ? formData.boundaryPath : null,
+      details: formData,
+    };
+
+    const { data, error } = await supabase
+      .from('fields')
+      .update(payload)
+      .eq('id', editingFieldId)
+      .select('id, name, area, soil_type, crop_stage, health_status, location, planted_date, latitude, longitude, boundary_path, details')
+      .single();
+
+    if (error) {
+      setFieldsError(error.message);
+      return;
+    }
+
+    if (data) {
+      const updated: Field = {
+        id: data.id,
+        name: data.name,
+        area: data.area ?? 0,
+        soilType: data.soil_type ?? 'Unknown',
+        cropStage: data.crop_stage ?? 'Growing',
+        healthStatus: data.health_status ?? 'Good',
+        location: data.location ?? 'Unknown',
+        plantedDate: data.planted_date ?? '',
+        latitude: data.latitude ?? undefined,
+        longitude: data.longitude ?? undefined,
+        boundaryPath: data.boundary_path ?? undefined,
+        details: data.details ?? undefined,
+      };
+
+      setFields((prev) => prev.map((f) => (f.id === updated.id ? updated : f)));
+    }
+
+    resetWizard();
   };
 
   const updateFormValue = <K extends keyof OrchardForm>(key: K, value: OrchardForm[K]) => {
@@ -609,6 +791,18 @@ const Fields = () => {
 
     setFieldsError(null);
 
+    // Calculate field coordinates from boundary center if boundary exists, otherwise use default
+    let fieldLat = 31.5204;
+    let fieldLng = 74.3587;
+    
+    if (formData.boundaryPath && formData.boundaryPath.length > 0) {
+      const center = calculateBoundaryCenter(formData.boundaryPath);
+      if (center) {
+        fieldLat = center.lat;
+        fieldLng = center.lng;
+      }
+    }
+
     const payload = {
       user_id: session.user.id,
       name: formData.name || 'New Orchard',
@@ -618,8 +812,8 @@ const Fields = () => {
       health_status: 'Good',
       location: formData.district || formData.zone || 'Unknown',
       planted_date: new Date().toISOString().slice(0, 10),
-      latitude: formData.latitude ?? null,
-      longitude: formData.longitude ?? null,
+      latitude: fieldLat,
+      longitude: fieldLng,
       boundary_path: formData.boundaryPath.length > 0 ? formData.boundaryPath : null,
       details: formData,
     };
@@ -628,7 +822,7 @@ const Fields = () => {
       .from('fields')
       .insert(payload)
       .select(
-        'id, name, area, soil_type, crop_stage, health_status, location, planted_date, latitude, longitude, boundary_path'
+        'id, name, area, soil_type, crop_stage, health_status, location, planted_date, latitude, longitude, boundary_path, details'
       )
       .single();
 
@@ -659,11 +853,7 @@ const Fields = () => {
   };
 
   const handleViewOnMap = (field: Field) => {
-    const query =
-      field.latitude && field.longitude
-        ? `${field.latitude},${field.longitude}`
-        : encodeURIComponent(field.location);
-    window.open(`https://www.google.com/maps?q=${query}`, '_blank', 'noopener,noreferrer');
+    navigate('/dashboard', { state: { focusFieldId: field.id } });
   };
 
   const handleGoToTree = (tag: TreeTag) => {
@@ -674,25 +864,76 @@ const Fields = () => {
     }
   };
 
-  const handleAddVarietyRow = () => {
+  const handleDeleteField = async (fieldId: string) => {
+    if (!confirm('Delete this field? This action cannot be undone.')) return;
+    if (!session?.user) return;
+
+    setFieldsError(null);
+
+    const { error } = await supabase.from('fields').delete().eq('id', fieldId);
+
+    if (error) {
+      setFieldsError(error.message);
+      return;
+    }
+
+    setFields((prev) => prev.filter((f) => f.id !== fieldId));
+
+    if (editingFieldId === fieldId) {
+      resetWizard();
+    }
+  };
+
+  // Row management handlers
+  const handleAddRow = () => {
+    const nextRowId = String(formData.rows.length + 1);
     setFormData((prev) => ({
       ...prev,
-      varietyTrees: [...prev.varietyTrees, { variety: '', totalTrees: '' }],
+      rows: [...prev.rows, { rowId: nextRowId, varieties: [{ variety: '', trees: '' }] }],
     }));
   };
 
-  const handleRemoveVarietyRow = (index: number) => {
+  const handleRemoveRow = (rowIndex: number) => {
     setFormData((prev) => ({
       ...prev,
-      varietyTrees: prev.varietyTrees.filter((_, rowIndex) => rowIndex !== index),
+      rows: prev.rows.filter((_, idx) => idx !== rowIndex),
     }));
   };
 
-  const handleVarietyRowChange = (index: number, key: keyof VarietyTreeRow, value: string) => {
+  const handleAddVarietyToRow = (rowIndex: number) => {
     setFormData((prev) => ({
       ...prev,
-      varietyTrees: prev.varietyTrees.map((row, rowIndex) =>
-        rowIndex === index ? { ...row, [key]: value } : row
+      rows: prev.rows.map((row, idx) =>
+        idx === rowIndex
+          ? { ...row, varieties: [...row.varieties, { variety: '', trees: '' }] }
+          : row
+      ),
+    }));
+  };
+
+  const handleRemoveVarietyFromRow = (rowIndex: number, varietyIndex: number) => {
+    setFormData((prev) => ({
+      ...prev,
+      rows: prev.rows.map((row, idx) =>
+        idx === rowIndex
+          ? { ...row, varieties: row.varieties.filter((_, vIdx) => vIdx !== varietyIndex) }
+          : row
+      ),
+    }));
+  };
+
+  const handleRowVarietyChange = (rowIndex: number, varietyIndex: number, field: 'variety' | 'trees', value: string) => {
+    setFormData((prev) => ({
+      ...prev,
+      rows: prev.rows.map((row, rIdx) =>
+        rIdx === rowIndex
+          ? {
+              ...row,
+              varieties: row.varieties.map((v, vIdx) =>
+                vIdx === varietyIndex ? { ...v, [field]: value } : v
+              ),
+            }
+          : row
       ),
     }));
   };
@@ -728,27 +969,19 @@ const Fields = () => {
     });
   };
 
-  const updatePinnedLocation = (lat: number, lng: number) => {
-    setFormData((prev) => ({
-      ...prev,
-      latitude: lat,
-      longitude: lng,
-    }));
-
-    const googleMaps = (window as Window & { google?: any }).google;
-    if (!googleMaps?.maps || !mapInstanceRef.current) {
-      return;
-    }
-
-    if (markerRef.current) {
-      markerRef.current.setMap(null);
-    }
-
-    markerRef.current = new googleMaps.maps.Marker({
-      position: { lat, lng },
-      map: mapInstanceRef.current,
+  const calculateBoundaryCenter = (boundaryPath: Array<{ lat: number; lng: number }>): { lat: number; lng: number } | null => {
+    if (!boundaryPath || boundaryPath.length === 0) return null;
+    
+    let lat = 0, lng = 0;
+    boundaryPath.forEach(point => {
+      lat += point.lat;
+      lng += point.lng;
     });
-    mapInstanceRef.current.panTo({ lat, lng });
+    
+    return {
+      lat: lat / boundaryPath.length,
+      lng: lng / boundaryPath.length,
+    };
   };
 
   const handleRemoveTreeTag = (tagId: string) => {
@@ -762,28 +995,121 @@ const Fields = () => {
     if (!file) {
       return;
     }
+    (async () => {
+      try {
+        const text = await file.text();
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(text, 'text/xml');
 
-    if (kmlObjectUrlRef.current) {
-      URL.revokeObjectURL(kmlObjectUrlRef.current);
-    }
+        // remove previous KML polygons
+        if (kmlPolygonsRef.current.length) {
+          kmlPolygonsRef.current.forEach((p) => p.setMap(null));
+          kmlPolygonsRef.current = [];
+        }
 
-    const objectUrl = URL.createObjectURL(file);
-    kmlObjectUrlRef.current = objectUrl;
+        const googleMaps = (window as Window & { google?: any }).google;
+        if (!googleMaps?.maps || !mapInstanceRef.current) {
+          return;
+        }
 
-    const googleMaps = (window as Window & { google?: any }).google;
-    if (!googleMaps?.maps || !mapInstanceRef.current) {
-      return;
-    }
+        const placemarks = Array.from(xml.getElementsByTagName('Placemark'));
+        const parsedPolygons: Array<Array<{ lat: number; lng: number }>> = [];
 
-    if (kmlLayerRef.current) {
-      kmlLayerRef.current.setMap(null);
-    }
+        placemarks.forEach((pm) => {
+          const polygons = Array.from(pm.getElementsByTagName('Polygon'));
+          polygons.forEach((poly) => {
+            const coordsElems = Array.from(poly.getElementsByTagName('coordinates'));
+            coordsElems.forEach((coordsElem) => {
+              const coordsText = coordsElem.textContent || '';
+              const coords = coordsText
+                .trim()
+                .split(/\s+/)
+                .map((c) => c.split(',').map((v) => v.trim()))
+                .filter((parts) => parts.length >= 2)
+                .map((parts) => ({ lat: Number(parts[1]), lng: Number(parts[0]) }));
 
-    kmlLayerRef.current = new googleMaps.maps.KmlLayer({
-      url: objectUrl,
-      map: mapInstanceRef.current,
-      preserveViewport: false,
+              if (coords.length) parsedPolygons.push(coords);
+            });
+          });
+        });
+
+        // Also support simple Polygon elements under Document
+        if (parsedPolygons.length === 0) {
+          const polygons = Array.from(xml.getElementsByTagName('Polygon'));
+          polygons.forEach((poly) => {
+            const coordsElems = Array.from(poly.getElementsByTagName('coordinates'));
+            coordsElems.forEach((coordsElem) => {
+              const coordsText = coordsElem.textContent || '';
+              const coords = coordsText
+                .trim()
+                .split(/\s+/)
+                .map((c) => c.split(',').map((v) => v.trim()))
+                .filter((parts) => parts.length >= 2)
+                .map((parts) => ({ lat: Number(parts[1]), lng: Number(parts[0]) }));
+              if (coords.length) parsedPolygons.push(coords);
+            });
+          });
+        }
+
+        // Render parsed polygons on the map
+        parsedPolygons.forEach((pts) => {
+          const polygon = new googleMaps.maps.Polygon({
+            paths: pts,
+            strokeColor: '#16a34a',
+            strokeOpacity: 0.9,
+            strokeWeight: 2,
+            fillColor: '#a7f3d0',
+            fillOpacity: 0.35,
+          });
+          polygon.setMap(mapInstanceRef.current);
+          kmlPolygonsRef.current.push(polygon);
+        });
+
+        // If we have at least one polygon, set it as boundaryPath and compute area
+        if (parsedPolygons.length > 0) {
+          const first = parsedPolygons[0];
+          const pathLatLng = first.map((pt) => new googleMaps.maps.LatLng(pt.lat, pt.lng));
+          let areaKanal: number | undefined = undefined;
+          try {
+            const areaSqm = googleMaps.maps.geometry.spherical.computeArea(pathLatLng as any);
+            areaKanal = areaSqm / KANAL_SQM;
+          } catch (e) {
+            // ignore if geometry library not available
+          }
+
+          setFormData((prev) => ({
+            ...prev,
+            boundaryPath: first,
+            mapAreaKanal: areaKanal ? Number(areaKanal.toFixed(2)) : prev.mapAreaKanal,
+          }));
+
+          // Fit map to polygon bounds
+          const bounds = new googleMaps.maps.LatLngBounds();
+          first.forEach((pt) => bounds.extend({ lat: pt.lat, lng: pt.lng } as any));
+          try { mapInstanceRef.current.fitBounds(bounds); } catch (e) { /* ignore */ }
+        }
+      } catch (error) {
+        console.error('Failed to parse KML', error);
+      }
+    })();
+  };
+
+  // Calculate summary statistics
+  const getRowSummary = () => {
+    const varietyTotals = new Map<string, number>();
+    let totalTrees = 0;
+
+    formData.rows.forEach((row) => {
+      row.varieties.forEach((v) => {
+        if (v.variety) {
+          const count = Number(v.trees) || 0;
+          varietyTotals.set(v.variety, (varietyTotals.get(v.variety) || 0) + count);
+          totalTrees += count;
+        }
+      });
     });
+
+    return { varietyTotals, totalTrees };
   };
 
   return (
@@ -864,8 +1190,16 @@ const Fields = () => {
                 >
                   View on Map
                 </Button>
-                <Button size="sm" className="flex-1">
+                <Button size="sm" className="flex-1" onClick={() => openWizardForEdit(field)}>
                   Edit Field
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="flex-1 text-red-600 border-red-200 hover:bg-red-50"
+                  onClick={() => handleDeleteField(field.id)}
+                >
+                  Delete
                 </Button>
               </div>
             </Card>
@@ -889,7 +1223,7 @@ const Fields = () => {
       {wizardOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/40" onClick={resetWizard} />
-          <div className="relative bg-white w-full max-w-5xl mx-4 rounded-2xl shadow-xl overflow-hidden">
+          <div className="relative bg-white w-full max-w-5xl mx-4 rounded-2xl shadow-xl overflow-hidden max-h-[95vh] flex flex-col">
             <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
               <div>
                 <h2 className="text-xl font-semibold text-gray-900">Field Creation</h2>
@@ -922,161 +1256,206 @@ const Fields = () => {
               </div>
             </div>
 
-            <div className="px-6 py-6 max-h-[70vh] overflow-y-auto">
+            <div className="px-6 py-6 overflow-y-auto flex-1">
               {wizardStep === 1 && (
                 <div className="space-y-6">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Orchard Name</label>
-                    <input
-                      type="text"
-                      value={formData.name}
-                      onChange={(e) => updateFormValue('name', e.target.value)}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Orchard Type</label>
-                    <select
-                      value={formData.orchardType}
-                      onChange={(e) => updateFormValue('orchardType', e.target.value)}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                    >
-                      <option value="">Select type</option>
-                      {orchardTypes.map((type) => (
-                        <option key={type} value={type}>
-                          {type}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Orchard Area (kanal)</label>
-                    <input
-                      type="number"
-                      min="0"
-                      value={formData.areaKanal}
-                      onChange={(e) => updateFormValue('areaKanal', e.target.value)}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Total Number of Trees</label>
-                    <input
-                      type="number"
-                      min="0"
-                      value={formData.totalTrees}
-                      onChange={(e) => updateFormValue('totalTrees', e.target.value)}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Number of Rows</label>
-                    <input
-                      type="number"
-                      min="0"
-                      value={formData.numberOfRows}
-                      onChange={(e) => updateFormValue('numberOfRows', e.target.value)}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Trees per Row</label>
-                    <input
-                      type="number"
-                      min="0"
-                      value={formData.treesPerRow}
-                      onChange={(e) => updateFormValue('treesPerRow', e.target.value)}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Age of Orchard (years)</label>
-                    <input
-                      type="number"
-                      min="0"
-                      value={formData.ageYears}
-                      onChange={(e) => updateFormValue('ageYears', e.target.value)}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Pollinator Type</label>
-                    <select
-                      value={formData.pollinatorType}
-                      onChange={(e) => updateFormValue('pollinatorType', e.target.value)}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                    >
-                      <option value="">Select pollinator variety</option>
-                      {getPollinatorsForOrchard().map((v) => (
-                        <option key={v.name} value={v.name}>
-                          {v.name}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Orchard Name</label>
+                      <input
+                        type="text"
+                        value={formData.name}
+                        onChange={(e) => updateFormValue('name', e.target.value)}
+                        className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Orchard Type</label>
+                      <select
+                        value={formData.orchardType}
+                        onChange={(e) => updateFormValue('orchardType', e.target.value)}
+                        className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                      >
+                        <option value="">Select type</option>
+                        {orchardTypes.map((type) => (
+                          <option key={type} value={type}>
+                            {type}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Orchard Area (kanal)</label>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={formData.areaKanal}
+                        onChange={(e) => updateFormValue('areaKanal', e.target.value)}
+                        className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                      />
+                    </div>
 
-                {formData.orchardType && (formData.orchardType === 'Traditional' || formData.orchardType === 'High Density') && (
-                  <div className="rounded-lg border border-green-200 bg-green-50 p-4">
-                    <h4 className="text-sm font-semibold text-green-900 mb-2">
-                      🍎 {formData.orchardType === 'Traditional' ? 'Traditional & Popular Local' : 'High-Density & Exotic'} Varieties
-                    </h4>
-                    <p className="text-xs text-green-700 mb-3">Recommended pollinators for your orchard type:</p>
-                    <div className="space-y-2">
-                      {getPollinatorsForOrchard().map((v) => (
-                        <div key={v.name} className="flex items-start gap-2 text-sm text-green-800">
-                          <span className="font-medium">• {v.name}:</span>
-                          <span className="text-green-700">{v.description}</span>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Age of Orchard (years)</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={formData.ageYears}
+                        onChange={(e) => updateFormValue('ageYears', e.target.value)}
+                        className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                      />
+                    </div>
+                    <div className="md:col-span-2">
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Pollinator Type</label>
+                      <select
+                        value={formData.pollinatorType}
+                        onChange={(e) => updateFormValue('pollinatorType', e.target.value)}
+                        className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                      >
+                        <option value="">Select pollinator variety</option>
+                        {getPollinatorsForOrchard().map((v) => (
+                          <option key={v.name} value={v.name}>
+                            {v.name} - {v.description}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-base font-semibold text-gray-900">Row Configuration</h3>
+                      <Button variant="outline" size="sm" onClick={handleAddRow}>
+                        <Plus className="w-4 h-4 mr-2" />
+                        Add Row
+                      </Button>
+                    </div>
+
+                    <div className="space-y-4">
+                      {formData.rows.map((row, rowIndex) => (
+                        <div key={`row-${rowIndex}`} className="rounded-lg border-2 border-gray-300 bg-gray-50 p-4">
+                          <div className="flex items-center justify-between mb-3">
+                            <h4 className="text-sm font-semibold text-gray-900">Row {row.rowId}</h4>
+                            <div className="flex gap-2">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handleAddVarietyToRow(rowIndex)}
+                              >
+                                <Plus className="w-3 h-3 mr-1" />
+                                Add Variety
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handleRemoveRow(rowIndex)}
+                                disabled={formData.rows.length === 1}
+                                className="text-red-600"
+                              >
+                                <X className="w-4 h-4" />
+                              </Button>
+                            </div>
+                          </div>
+
+                          <div className="space-y-2">
+                            {row.varieties.map((varietyInRow, varietyIndex) => (
+                              <div key={`row-${rowIndex}-variety-${varietyIndex}`} className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end bg-white p-3 rounded border border-gray-200">
+                                <div>
+                                  <label className="block text-xs font-medium text-gray-600 mb-1">Variety</label>
+                                  <select
+                                    value={varietyInRow.variety}
+                                    onChange={(e) => handleRowVarietyChange(rowIndex, varietyIndex, 'variety', e.target.value)}
+                                    className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent text-sm"
+                                  >
+                                    <option value="">Select variety</option>
+                                    {getAvailableVarieties().map((v) => (
+                                      <option key={v.name} value={v.name}>
+                                        {v.name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-gray-600 mb-1">Trees</label>
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    placeholder="Number"
+                                    value={varietyInRow.trees}
+                                    onChange={(e) => handleRowVarietyChange(rowIndex, varietyIndex, 'trees', e.target.value)}
+                                    className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent text-sm"
+                                  />
+                                </div>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => handleRemoveVarietyFromRow(rowIndex, varietyIndex)}
+                                  disabled={row.varieties.length === 1}
+                                  className="mb-1"
+                                >
+                                  <X className="w-4 h-4" />
+                                </Button>
+                              </div>
+                            ))}
+                          </div>
+
+                          {/* Row subtotal */}
+                          <div className="mt-3 pt-3 border-t border-gray-300 flex justify-between text-sm">
+                            <span className="font-medium text-gray-700">Row {row.rowId} Total:</span>
+                            <span className="font-semibold text-green-700">
+                              {row.varieties.reduce((sum, v) => sum + (Number(v.trees) || 0), 0)} trees
+                            </span>
+                          </div>
                         </div>
                       ))}
                     </div>
-                  </div>
-                )}
 
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-base font-semibold text-gray-900">Variety-wise Total Trees</h3>
-                    <Button variant="outline" size="sm" onClick={handleAddVarietyRow}>
-                      Add Variety
-                    </Button>
-                  </div>
-                  <div className="space-y-3">
-                    {formData.varietyTrees.map((row, index) => (
-                      <div key={`variety-${index}`} className="grid grid-cols-1 md:grid-cols-[2fr_1fr_auto] gap-3 items-center">
-                        <select
-                          value={row.variety}
-                          onChange={(e) => handleVarietyRowChange(index, 'variety', e.target.value)}
-                          className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                        >
-                          <option value="">Select variety</option>
-                          {getAvailableVarieties().map((v) => (
-                            <option key={v.name} value={v.name}>
-                              {v.name}
-                            </option>
-                          ))}
-                        </select>
-                        <input
-                          type="number"
-                          min="0"
-                          placeholder="Total trees"
-                          value={row.totalTrees}
-                          onChange={(e) => handleVarietyRowChange(index, 'totalTrees', e.target.value)}
-                          className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                        />
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => handleRemoveVarietyRow(index)}
-                          disabled={formData.varietyTrees.length === 1}
-                        >
-                          Remove
-                        </Button>
+                    {/* Overall Summary */}
+                    <div className="rounded-lg border-2 border-green-200 bg-green-50 p-4 space-y-3">
+                      <h3 className="text-sm font-semibold text-gray-900">Orchard Summary</h3>
+
+                      {/* Variety breakdown */}
+                      <div className="space-y-2">
+                        <p className="text-xs font-medium text-gray-700 mb-2">Variety Breakdown:</p>
+                        {(() => {
+                          const { varietyTotals } = getRowSummary();
+
+                          if (varietyTotals.size === 0) {
+                            return <p className="text-xs text-gray-600">Add varieties to see breakdown</p>;
+                          }
+
+                          return Array.from(varietyTotals.entries()).map(([variety, count]) => (
+                            <div key={variety} className="flex justify-between text-sm text-gray-700 py-1 border-b border-green-200 last:border-b-0">
+                              <div className="flex items-center gap-2">
+                                <span
+                                  className="inline-block h-3 w-3 rounded-full"
+                                  style={{ backgroundColor: getVarietyColor(variety) }}
+                                />
+                                <span>{variety}</span>
+                              </div>
+                              <span className="font-medium">{count} trees</span>
+                            </div>
+                          ));
+                        })()}
                       </div>
-                    ))}
+
+                      {/* Net total */}
+                      <div className="pt-2 border-t-2 border-green-300 flex justify-between items-center">
+                        <span className="font-semibold text-gray-900">Net Total Trees:</span>
+                        <span className="text-lg font-bold text-green-700">
+                          {getRowSummary().totalTrees}
+                        </span>
+                      </div>
+
+                      {/* Row count */}
+                      <div className="flex justify-between text-sm text-gray-700">
+                        <span>Total Rows:</span>
+                        <span className="font-medium">{formData.rows.length}</span>
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
               )}
 
               {wizardStep === 2 && (
@@ -1222,7 +1601,7 @@ const Fields = () => {
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <h3 className="text-lg font-semibold text-gray-900">Orchard Map</h3>
-                      <p className="text-sm text-gray-500">Pin the location and draw the orchard boundary.</p>
+                      <p className="text-sm text-gray-500">Pin the location, draw boundary, and tag individual trees.</p>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <Button
@@ -1230,7 +1609,7 @@ const Fields = () => {
                         size="sm"
                         onClick={() => setTaggingMode((prev) => !prev)}
                       >
-                        {taggingMode ? 'Tagging On' : 'Tag Trees'}
+                        {taggingMode ? 'Tagging On ✓' : 'Tag Trees'}
                       </Button>
                       <Button variant="outline" size="sm" onClick={handleClearBoundary}>
                         Clear Boundary
@@ -1240,6 +1619,7 @@ const Fields = () => {
                       </Button>
                     </div>
                   </div>
+
                   <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4">
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">Upload KML File</label>
@@ -1250,21 +1630,21 @@ const Fields = () => {
                         className="w-full rounded-lg border border-gray-300 px-3 py-2"
                       />
                       <p className="text-xs text-gray-500 mt-1">
-                        Uploading a file will load the KML overlay on the map.
+                        Upload KML to auto-load boundary and calculate area.
                       </p>
                     </div>
-                    <div className="rounded-lg border border-gray-200 p-3">
-                      <p className="text-xs text-gray-500">Tree Tags Total</p>
-                      <p className="text-lg font-semibold text-gray-900">{formData.treeTags.length}</p>
+                    <div className="rounded-lg border border-gray-200 p-3 bg-gray-50">
+                      <p className="text-xs text-gray-500 mb-1">Tree Tags</p>
+                      <p className="text-lg font-semibold text-gray-900">{formData.treeTags.length} tagged</p>
                       {formData.treeTags.length > 0 && (
                         <div className="mt-3 space-y-2">
                           {[...new Set(formData.treeTags.map((tag) => tag.variety).filter(Boolean))].map((variety) => (
-                            <div key={variety} className="flex items-center gap-2 text-sm text-gray-700">
+                            <div key={variety} className="flex items-center gap-2 text-xs text-gray-700">
                               <span
                                 className="inline-block h-3 w-3 rounded-full"
                                 style={{ backgroundColor: getVarietyColor(variety) }}
                               />
-                              {variety}
+                              {variety}: {formData.treeTags.filter(t => t.variety === variety).length}
                             </div>
                           ))}
                         </div>
@@ -1284,24 +1664,24 @@ const Fields = () => {
                   )}
 
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div className="rounded-lg border border-gray-200 p-3">
-                      <p className="text-xs text-gray-500">Pinned Location</p>
+                    <div className="rounded-lg border border-gray-200 p-3 bg-gray-50">
+                      <p className="text-xs text-gray-500 mb-1">Pinned Location</p>
                       <p className="text-sm text-gray-800">
                         {formData.latitude && formData.longitude
                           ? `${formData.latitude.toFixed(5)}, ${formData.longitude.toFixed(5)}`
-                          : 'Click on the map to pin.'}
+                          : 'Click map or use Auto Detect'}
                       </p>
                     </div>
-                    <div className="rounded-lg border border-gray-200 p-3">
-                      <p className="text-xs text-gray-500">Boundary Points</p>
+                    <div className="rounded-lg border border-gray-200 p-3 bg-gray-50">
+                      <p className="text-xs text-gray-500 mb-1">Boundary Points</p>
                       <p className="text-sm text-gray-800">
-                        {formData.boundaryPath.length ? `${formData.boundaryPath.length} points` : 'Not drawn yet'}
+                        {formData.boundaryPath.length ? `${formData.boundaryPath.length} points` : 'Draw or upload KML'}
                       </p>
                     </div>
-                    <div className="rounded-lg border border-gray-200 p-3">
-                      <p className="text-xs text-gray-500">Map Area (kanal)</p>
-                      <p className="text-sm text-gray-800">
-                        {formData.mapAreaKanal ? formData.mapAreaKanal : 'Draw boundary to calculate'}
+                    <div className="rounded-lg border border-gray-200 p-3 bg-gray-50">
+                      <p className="text-xs text-gray-500 mb-1">Calculated Area (kanal)</p>
+                      <p className="text-sm text-gray-800 font-semibold">
+                        {formData.mapAreaKanal ? formData.mapAreaKanal : 'Draw boundary first'}
                       </p>
                     </div>
                   </div>
@@ -1315,8 +1695,8 @@ const Fields = () => {
                         <div className="flex-1">
                           <h4 className="text-sm font-semibold text-green-900 mb-1">Boundary Saved Successfully</h4>
                           <p className="text-xs text-green-700">
-                            Your orchard boundary with {formData.boundaryPath.length} points will be saved with the field. 
-                            You can click on the boundary to view details.
+                            {formData.boundaryPath.length} points covering {formData.mapAreaKanal || '?'} kanal.
+                            Click "Save Map Area" to update the orchard area field.
                           </p>
                         </div>
                       </div>
@@ -1324,20 +1704,20 @@ const Fields = () => {
                   )}
 
                   {formData.treeTags.length > 0 && (
-                    <div className="rounded-lg border border-gray-200 p-4">
+                    <div className="rounded-lg border border-gray-200 p-4 bg-white">
                       <div className="flex items-center justify-between mb-3">
                         <h4 className="text-sm font-semibold text-gray-900">Tagged Trees ({formData.treeTags.length})</h4>
                         <p className="text-xs text-gray-500">
-                          {selectedTreeId ? '✨ Tree selected - highlighted on map' : 'Click a tree to highlight it'}
+                          {selectedTreeId ? '✨ Tree selected' : 'Click a tree to highlight it'}
                         </p>
                       </div>
-                      <div className="space-y-2 max-h-40 overflow-y-auto">
+                      <div className="space-y-2 max-h-48 overflow-y-auto">
                         {formData.treeTags.map((tag) => (
-                          <div 
-                            key={tag.id} 
+                          <div
+                            key={tag.id}
                             className={`flex items-center justify-between text-sm text-gray-700 p-2 rounded cursor-pointer transition-colors ${
-                              selectedTreeId === tag.id 
-                                ? 'bg-yellow-100 border-2 border-yellow-400' 
+                              selectedTreeId === tag.id
+                                ? 'bg-yellow-100 border-2 border-yellow-400'
                                 : 'hover:bg-gray-50 border-2 border-transparent'
                             }`}
                             onClick={() => handleGoToTree(tag)}
@@ -1347,9 +1727,9 @@ const Fields = () => {
                                 className="inline-block h-3 w-3 rounded-full"
                                 style={{ backgroundColor: getVarietyColor(tag.variety) }}
                               />
-                              <span>{tag.name || 'Unnamed Tree'}</span>
+                              <span className="font-medium">{tag.name || 'Unnamed'}</span>
                               {tag.variety && <span className="text-xs text-gray-500">({tag.variety})</span>}
-                              {tag.rowNumber && <span className="text-xs text-gray-500">Row {tag.rowNumber}</span>}
+                              {tag.rowNumber && <span className="text-xs bg-green-100 px-2 py-0.5 rounded">Row {tag.rowNumber}</span>}
                             </div>
                             <button
                               type="button"
@@ -1357,7 +1737,7 @@ const Fields = () => {
                                 e.stopPropagation();
                                 handleRemoveTreeTag(tag.id);
                               }}
-                              className="text-xs text-red-500 hover:text-red-600"
+                              className="text-xs text-red-500 hover:text-red-600 px-2 py-1"
                             >
                               Remove
                             </button>
@@ -1370,7 +1750,7 @@ const Fields = () => {
               )}
             </div>
 
-            <div className="px-6 py-4 border-t border-gray-200 flex items-center justify-between">
+            <div className="px-6 py-4 border-t border-gray-200 flex items-center justify-between bg-gray-50">
               <Button
                 variant="outline"
                 onClick={() => setWizardStep((prev) => Math.max(1, prev - 1))}
@@ -1381,7 +1761,9 @@ const Fields = () => {
               {wizardStep < 4 ? (
                 <Button onClick={() => setWizardStep((prev) => Math.min(4, prev + 1))}>Next</Button>
               ) : (
-                <Button onClick={handleCreateField}>Create Field</Button>
+                <Button onClick={editingFieldId ? handleUpdateField : handleCreateField}>
+                  {editingFieldId ? 'Save Changes' : 'Create Field'}
+                </Button>
               )}
             </div>
           </div>
@@ -1415,6 +1797,7 @@ const Fields = () => {
           </div>
         </div>
       )}
+
       {tagFormOpen && pendingTagLocation && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center">
           <div className="absolute inset-0 bg-black/40" onClick={() => setTagFormOpen(false)} />
@@ -1437,6 +1820,7 @@ const Fields = () => {
                   type="text"
                   value={tagFormData.name}
                   onChange={(e) => setTagFormData((prev) => ({ ...prev, name: e.target.value }))}
+                  placeholder="e.g., Tree-A1, Main-1, etc."
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
                 />
               </div>
@@ -1463,13 +1847,19 @@ const Fields = () => {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Row Number</label>
-                <input
-                  type="number"
-                  min="1"
+                <select
                   value={tagFormData.rowNumber}
                   onChange={(e) => setTagFormData((prev) => ({ ...prev, rowNumber: e.target.value }))}
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                />
+                >
+                  <option value="">Select row</option>
+                  {formData.rows.map((row) => (
+                    <option key={row.rowId} value={row.rowId}>
+                      Row {row.rowId}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-gray-500 mt-1">Link this tree to a specific row in your orchard</p>
               </div>
             </div>
             <div className="mt-6 flex items-center justify-end gap-2">

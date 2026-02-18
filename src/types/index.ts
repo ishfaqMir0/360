@@ -25,6 +25,7 @@ export interface Field {
   latitude?: number;
   longitude?: number;
   boundaryPath?: Array<{ lat: number; lng: number }>;
+  details?: any;
 }
 
 export interface DashboardStats {

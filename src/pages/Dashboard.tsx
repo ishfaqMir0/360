@@ -1,24 +1,54 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MapPin, TreePine, TriangleAlert as AlertTriangle, Cloud, TrendingUp, Calendar, UserCircle, CheckCircle2, Navigation } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import Card from '../components/UI/Card';
 import Button from '../components/UI/Button';
 import type { User, Field } from '../types';
 import { supabase } from '../lib/supabaseClient';
 import { useAuth } from '../contexts/AuthContext';
 
+type TreeTag = {
+  id: string;
+  name: string;
+  variety: string;
+  rowNumber: string;
+  latitude: number;
+  longitude: number;
+};
+
+type FieldWithDetails = Field & {
+  details?: {
+    treeTags?: TreeTag[];
+    rows?: Array<{
+      rowId: string;
+      varieties: Array<{ variety: string; trees: string }>;
+    }>;
+  };
+};
+
 const Dashboard: React.FC = () => {
   const navigate = useNavigate();
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<any>(null);
+  const treeMarkersRef = useRef<any[]>([]);
   const [mapsLoaded, setMapsLoaded] = useState(false);
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
-  const [fields, setFields] = useState<Field[]>([]);
+  const [fields, setFields] = useState<FieldWithDetails[]>([]);
   const [loadingFields, setLoadingFields] = useState(false);
   const [fieldsError, setFieldsError] = useState<string | null>(null);
   const [activities, setActivities] = useState<Array<{ id: string; title: string; createdAt: string; kind: 'success' | 'warning' | 'info' }>>([]);
   const [activityError, setActivityError] = useState<string | null>(null);
   const { user, session } = useAuth();
+  const location = useLocation();
+  const focusFieldId = (location.state as any)?.focusFieldId ?? null;
+
+  const varietyPalette = ['#22c55e', '#f97316', '#3b82f6', '#e11d48', '#a855f7', '#14b8a6'];
+
+  const getVarietyColor = (variety: string) => {
+    if (!variety) return '#6b7280';
+    const hash = variety.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+    return varietyPalette[hash % varietyPalette.length];
+  };
 
   const profileUser: User = user ?? {
     id: session?.user.id ?? '',
@@ -32,13 +62,10 @@ const Dashboard: React.FC = () => {
     let completed = 0;
     const totalFields = 7;
 
-    // Required fields (4)
     if (user.name?.trim()) completed++;
     if (user.email?.trim()) completed++;
     if (user.phone?.trim()) completed++;
     if (user.farmName?.trim()) completed++;
-
-    // Optional fields (3)
     if (user.avatar?.trim()) completed++;
     if (user.khasraNumber?.trim()) completed++;
     if (user.khataNumber?.trim()) completed++;
@@ -47,6 +74,24 @@ const Dashboard: React.FC = () => {
   };
 
   const profileCompletion = calculateProfileCompletion(profileUser);
+
+  // Calculate total statistics
+  const totalArea = fields.reduce((sum, f) => sum + (f.area || 0), 0);
+  const totalTrees = fields.reduce((sum, f) => {
+    const treeTags = f.details?.treeTags || [];
+    return sum + treeTags.length;
+  }, 0);
+
+  // Get all unique varieties across all fields
+  const allVarieties = new Map<string, number>();
+  fields.forEach(field => {
+    const treeTags = field.details?.treeTags || [];
+    treeTags.forEach(tag => {
+      if (tag.variety) {
+        allVarieties.set(tag.variety, (allVarieties.get(tag.variety) || 0) + 1);
+      }
+    });
+  });
 
   useEffect(() => {
     const loadGoogleMaps = () => {
@@ -85,7 +130,7 @@ const Dashboard: React.FC = () => {
       const { data, error } = await supabase
         .from('fields')
         .select(
-          'id, name, area, soil_type, crop_stage, health_status, location, planted_date, latitude, longitude, boundary_path'
+          'id, name, area, soil_type, crop_stage, health_status, location, planted_date, latitude, longitude, boundary_path, details'
         )
         .eq('user_id', session.user.id);
 
@@ -95,7 +140,7 @@ const Dashboard: React.FC = () => {
         return;
       }
 
-      const mappedFields: Field[] = (data ?? []).map((row: any) => ({
+      const mappedFields: FieldWithDetails[] = (data ?? []).map((row: any) => ({
         id: row.id,
         name: row.name,
         area: row.area ?? 0,
@@ -107,6 +152,7 @@ const Dashboard: React.FC = () => {
         latitude: row.latitude ?? undefined,
         longitude: row.longitude ?? undefined,
         boundaryPath: row.boundary_path ?? undefined,
+        details: row.details ?? undefined,
       }));
 
       setFields(mappedFields);
@@ -161,7 +207,20 @@ const Dashboard: React.FC = () => {
       return;
     }
 
-    // Calculate center based on all fields
+    // Clear previous map
+    try {
+      if (mapRef.current && mapInstanceRef.current) {
+        mapRef.current.innerHTML = '';
+        mapInstanceRef.current = null;
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // Clear previous tree markers
+    treeMarkersRef.current.forEach(marker => marker.setMap(null));
+    treeMarkersRef.current = [];
+
     const fieldsWithCoords = fields.filter(f => f.latitude && f.longitude);
     if (fieldsWithCoords.length === 0) {
       return;
@@ -178,10 +237,15 @@ const Dashboard: React.FC = () => {
 
     mapInstanceRef.current = map;
 
-    // Add markers for all fields
+    const bounds = new googleMaps.maps.LatLngBounds();
+
+    // Add field markers, boundaries, and tree tags
     fieldsWithCoords.forEach((field) => {
+      const position = { lat: field.latitude!, lng: field.longitude! };
+
+      // Field center marker
       const marker = new googleMaps.maps.Marker({
-        position: { lat: field.latitude!, lng: field.longitude! },
+        position,
         map,
         title: field.name,
         label: {
@@ -192,24 +256,148 @@ const Dashboard: React.FC = () => {
         },
       });
 
+      const treeTags = field.details?.treeTags || [];
+      const infoContent = `
+        <div style="padding: 8px; min-width: 200px;">
+          <h3 style="font-weight: 600; margin-bottom: 4px;">${field.name}</h3>
+          <p style="font-size: 12px; color: #666; margin: 2px 0;">Area: ${field.area} kanal</p>
+          <p style="font-size: 12px; color: #666; margin: 2px 0;">Status: ${field.healthStatus}</p>
+          <p style="font-size: 12px; color: #666; margin: 2px 0;">Trees: ${treeTags.length}</p>
+          ${treeTags.length > 0 ? `
+            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #e5e7eb;">
+              <p style="font-size: 11px; font-weight: 600; color: #374151; margin-bottom: 4px;">Varieties:</p>
+              ${Array.from(new Set(treeTags.map(t => t.variety).filter(Boolean))).map(variety => {
+                const count = treeTags.filter(t => t.variety === variety).length;
+                const color = getVarietyColor(variety);
+                return `<div style="display: flex; align-items: center; gap: 6px; margin: 2px 0; font-size: 11px;">
+                  <span style="width: 10px; height: 10px; border-radius: 50%; background: ${color}; display: inline-block;"></span>
+                  <span style="color: #4b5563;">${variety}: ${count}</span>
+                </div>`;
+              }).join('')}
+            </div>
+          ` : ''}
+        </div>
+      `;
+
       const infoWindow = new googleMaps.maps.InfoWindow({
-        content: `
-          <div style="padding: 8px;">
-            <h3 style="font-weight: 600; margin-bottom: 4px;">${field.name}</h3>
-            <p style="font-size: 12px; color: #666;">Area: ${field.area} kanal</p>
-            <p style="font-size: 12px; color: #666;">Status: ${field.healthStatus}</p>
-          </div>
-        `,
+        content: infoContent,
       });
 
       marker.addListener('click', () => {
         setSelectedFieldId(field.id);
         infoWindow.open(map, marker);
       });
-    });
-  }, [mapsLoaded, fields]);
 
-  const handleViewField = (field: Field) => {
+      bounds.extend(position as any);
+
+      // Render boundary polygon
+      if (field.boundaryPath) {
+        let path: any = field.boundaryPath;
+
+        if (typeof path === 'string') {
+          try {
+            path = JSON.parse(path);
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        if (Array.isArray(path) && path.length > 0) {
+          if (Array.isArray(path[0]) && typeof path[0][0] === 'number') {
+            path = path.map((pt: any) => ({ lat: pt[1], lng: pt[0] }));
+          }
+
+          const polygon = new googleMaps.maps.Polygon({
+            paths: path,
+            strokeColor: '#16a34a',
+            strokeOpacity: 0.9,
+            strokeWeight: 2,
+            fillColor: '#a7f3d0',
+            fillOpacity: 0.25,
+          });
+
+          polygon.setMap(map);
+
+          (path as Array<any>).forEach((pt: any) => {
+            if (pt && typeof pt.lat === 'number' && typeof pt.lng === 'number') {
+              bounds.extend({ lat: pt.lat, lng: pt.lng } as any);
+            }
+          });
+        }
+      }
+
+      // Render tree tags as colored tree markers
+      if (treeTags.length > 0) {
+        treeTags.forEach(tag => {
+          const color = getVarietyColor(tag.variety);
+          const svg =
+            `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">` +
+            `<circle cx="32" cy="24" r="18" fill="${color}" />` +
+            `<rect x="28" y="36" width="8" height="18" fill="#8b5a2b"/>` +
+            `</svg>`;
+
+          const treeMarker = new googleMaps.maps.Marker({
+            position: { lat: tag.latitude, lng: tag.longitude },
+            map,
+            title: `${tag.name} - ${tag.variety}`,
+            icon: {
+              url: `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`,
+              scaledSize: new googleMaps.maps.Size(32, 32),
+              anchor: new googleMaps.maps.Point(16, 32),
+            },
+          });
+
+          const treeInfoContent = `
+            <div style="padding: 8px;">
+              <h4 style="font-weight: 600; margin-bottom: 4px;">${tag.name}</h4>
+              <p style="font-size: 12px; color: #666; margin: 2px 0;">Variety: ${tag.variety}</p>
+              <p style="font-size: 12px; color: #666; margin: 2px 0;">Row: ${tag.rowNumber}</p>
+              <p style="font-size: 11px; color: #888; margin: 4px 0 0 0;">Field: ${field.name}</p>
+            </div>
+          `;
+
+          const treeInfoWindow = new googleMaps.maps.InfoWindow({
+            content: treeInfoContent,
+          });
+
+          treeMarker.addListener('click', () => {
+            treeInfoWindow.open(map, treeMarker);
+            map.panTo({ lat: tag.latitude, lng: tag.longitude });
+            map.setZoom(18);
+          });
+
+          treeMarkersRef.current.push(treeMarker);
+          bounds.extend({ lat: tag.latitude, lng: tag.longitude } as any);
+        });
+      }
+    });
+
+    // Fit map to bounds
+    try {
+      map.fitBounds(bounds);
+    } catch (e) {
+      // fallback
+    }
+
+    // Handle focus field from navigation
+    if (focusFieldId) {
+      const target = fields.find((f) => f.id === focusFieldId);
+      if (target && target.latitude && target.longitude) {
+        setTimeout(() => {
+          map.panTo({ lat: target.latitude!, lng: target.longitude! });
+          map.setZoom(16);
+          setSelectedFieldId(target.id);
+          try {
+            navigate('/dashboard', { replace: true, state: {} });
+          } catch (e) {
+            // ignore
+          }
+        }, 300);
+      }
+    }
+  }, [mapsLoaded, fields, focusFieldId]);
+
+  const handleViewField = (field: FieldWithDetails) => {
     if (field.latitude && field.longitude && mapInstanceRef.current) {
       mapInstanceRef.current.panTo({ lat: field.latitude, lng: field.longitude });
       mapInstanceRef.current.setZoom(16);
@@ -252,54 +440,100 @@ const Dashboard: React.FC = () => {
       bgColor: 'bg-blue-50',
     },
     {
-      title: 'Healthy Trees',
-      value: '0',
+      title: 'Total Trees',
+      value: totalTrees,
       icon: TreePine,
       color: 'text-green-600',
       bgColor: 'bg-green-50',
     },
     {
-      title: 'Active Alerts',
-      value: 0,
-      icon: AlertTriangle,
-      color: 'text-orange-600',
-      bgColor: 'bg-orange-50',
-    },
-    {
-      title: 'Weather',
-      value: 'N/A',
-      icon: Cloud,
+      title: 'Total Area',
+      value: `${totalArea.toFixed(1)} kanal`,
+      icon: MapPin,
       color: 'text-purple-600',
       bgColor: 'bg-purple-50',
+    },
+    {
+      title: 'Varieties',
+      value: allVarieties.size,
+      icon: TreePine,
+      color: 'text-orange-600',
+      bgColor: 'bg-orange-50',
     },
   ];
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 max-w-7xl mx-auto px-6">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold text-gray-900">Dashboard</h1>
         <div className="flex items-center space-x-2 text-sm text-gray-500">
           <Calendar className="w-4 h-4" />
-          <span>{new Date().toLocaleDateString('en-US', { 
-            weekday: 'long', 
-            year: 'numeric', 
-            month: 'long', 
-            day: 'numeric' 
+          <span>{new Date().toLocaleDateString('en-US', {
+            weekday: 'long',
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
           })}</span>
         </div>
       </div>
 
-      {/* Orchard Map Overview - First Card */}
-      <Card className="p-6">
+      {/* Stats Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        {stats.map((stat, index) => (
+          <Card key={index} className="p-6 bg-white shadow rounded-2xl">
+            <div className="flex items-center">
+              <div className={`p-3 rounded-lg ${stat.bgColor}`}>
+                <stat.icon className={`w-7 h-7 ${stat.color}`} />
+              </div>
+              <div className="ml-4">
+                <p className="text-sm font-medium text-gray-600">{stat.title}</p>
+                <p className="text-2xl font-bold text-gray-900">{stat.value}</p>
+              </div>
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      {/* Variety Breakdown */}
+      {allVarieties.size > 0 && (
+        <Card className="p-6 bg-white shadow-xl rounded-2xl">
+          <h2 className="text-xl font-bold text-gray-900 mb-4">Variety Distribution Across All Fields</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {Array.from(allVarieties.entries()).map(([variety, count]) => (
+              <div key={variety} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                <div className="flex items-center gap-3">
+                  <span
+                    className="inline-block h-4 w-4 rounded-full border-2 border-white shadow"
+                    style={{ backgroundColor: getVarietyColor(variety) }}
+                  />
+                  <span className="font-medium text-gray-900">{variety}</span>
+                </div>
+                <span className="text-lg font-bold text-gray-700">{count}</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {/* Orchard Map Overview */}
+      <Card className="p-6 bg-white shadow-xl rounded-2xl">
         <div className="flex items-center justify-between mb-4">
           <div>
             <h2 className="text-xl font-bold text-gray-900">Orchard Map Overview</h2>
-            <p className="text-sm text-gray-500">All saved fields and locations</p>
+            <p className="text-sm text-gray-500">All fields with tree positions and boundaries</p>
           </div>
-          <Button onClick={() => navigate('/fields')} size="sm" variant="outline">
-            <MapPin className="w-4 h-4 mr-2" />
-            View All Fields
-          </Button>
+          <div className="flex items-center gap-3">
+            <Button onClick={() => navigate('/fields')} size="sm" variant="outline">
+              <MapPin className="w-4 h-4 mr-2" />
+              View All Fields
+            </Button>
+            <button
+              onClick={() => window.location.reload()}
+              className="px-3 py-2 rounded-lg bg-white shadow hover:shadow-md border text-sm"
+            >
+              Refresh Map
+            </button>
+          </div>
         </div>
 
         {fieldsError && (
@@ -308,15 +542,15 @@ const Dashboard: React.FC = () => {
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Map Section */}
-          <div className="lg:col-span-2 relative">
+        <div className="space-y-6">
+          {/* Map container */}
+          <div className="relative">
             {loadingFields ? (
-              <div className="w-full h-96 rounded-lg border border-gray-200 bg-gray-50 flex items-center justify-center">
+              <div className="w-full h-96 rounded-2xl shadow-2xl border border-gray-200 bg-gradient-to-br from-white via-gray-50 to-gray-100 flex items-center justify-center">
                 <p className="text-sm text-gray-500">Loading fields...</p>
               </div>
             ) : fields.length === 0 ? (
-              <div className="w-full h-96 rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 flex items-center justify-center">
+              <div className="w-full h-96 rounded-2xl shadow-2xl border-2 border-dashed border-gray-300 bg-gradient-to-br from-white via-gray-50 to-gray-100 flex items-center justify-center">
                 <div className="text-center">
                   <MapPin className="w-16 h-16 text-gray-300 mx-auto mb-4" />
                   <h3 className="text-lg font-semibold text-gray-700 mb-2">No Orchards Mapped Yet</h3>
@@ -331,22 +565,41 @@ const Dashboard: React.FC = () => {
               <>
                 <div
                   ref={mapRef}
-                  className="w-full h-96 rounded-lg border border-gray-200 bg-gray-100"
+                  className="w-full h-[680px] rounded-2xl shadow-2xl border border-gray-200 bg-gray-100 overflow-hidden"
                 />
                 {!import.meta.env.VITE_GOOGLE_API_KEY && (
-                  <div className="absolute inset-0 flex items-center justify-center bg-gray-100 rounded-lg">
+                  <div className="absolute inset-0 flex items-center justify-center bg-gray-100 rounded-2xl">
                     <p className="text-sm text-gray-500">Map requires Google Maps API key</p>
+                  </div>
+                )}
+
+                {/* Map Legend for Tree Varieties */}
+                {allVarieties.size > 0 && (
+                  <div className="absolute top-4 right-4 bg-white rounded-lg shadow-lg border border-gray-300 p-4 max-w-xs">
+                    <h5 className="text-sm font-semibold text-gray-900 mb-3">Tree Legend</h5>
+                    <div className="space-y-2">
+                      {Array.from(allVarieties.entries()).map(([variety, count]) => (
+                        <div key={variety} className="flex items-center gap-2 text-xs">
+                          <svg width="20" height="26" viewBox="0 0 64 64" className="flex-shrink-0">
+                            <circle cx="32" cy="24" r="18" fill={getVarietyColor(variety)} />
+                            <rect x="28" y="36" width="8" height="18" fill="#8b5a2b"/>
+                          </svg>
+                          <div className="flex-1 min-w-0">
+                            <div className="font-medium truncate text-gray-900">{variety}</div>
+                            <div className="text-gray-500">{count} trees</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
               </>
             )}
           </div>
 
-          {/* Fields List */}
-          <div className="space-y-3 max-h-96 overflow-y-auto">
-            <h3 className="text-sm font-semibold text-gray-700 sticky top-0 bg-white pb-2">
-              Saved Fields ({fields.length})
-            </h3>
+          {/* Saved fields below map */}
+          <Card className="p-4 bg-gray-50">
+            <h3 className="text-sm font-semibold text-gray-700 mb-3">Saved Fields ({fields.length})</h3>
             {loadingFields ? (
               <div className="flex flex-col items-center justify-center py-12 text-center">
                 <p className="text-sm text-gray-500">Loading fields...</p>
@@ -361,65 +614,74 @@ const Dashboard: React.FC = () => {
                 </Button>
               </div>
             ) : (
-              fields.map((field) => (
-              <div
-                key={field.id}
-                className={`p-3 rounded-lg border-2 transition-all cursor-pointer ${
-                  selectedFieldId === field.id
-                    ? 'border-green-500 bg-green-50'
-                    : 'border-gray-200 hover:border-green-300 bg-white'
-                }`}
-                onClick={() => handleViewField(field)}
-              >
-                <div className="flex items-start justify-between mb-2">
-                  <h4 className="font-semibold text-gray-900 text-sm">{field.name}</h4>
-                  <span className={`text-xs px-2 py-1 rounded-full font-medium ${getHealthStatusColor(field.healthStatus)}`}>
-                    {field.healthStatus}
-                  </span>
-                </div>
-                <div className="space-y-1 text-xs text-gray-600">
-                  <div className="flex items-center gap-2">
-                    <MapPin className="w-3 h-3" />
-                    <span>{field.location}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span>Area: {field.area} kanal</span>
-                    <span>{field.cropStage}</span>
-                  </div>
-                  {field.latitude && field.longitude && (
-                    <div className="flex items-center gap-1 text-blue-600">
-                      <Navigation className="w-3 h-3" />
-                      <span>{field.latitude.toFixed(4)}, {field.longitude.toFixed(4)}</span>
-                    </div>
-                  )}
-                </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {fields.map((field) => {
+                  const treeTags = field.details?.treeTags || [];
+                  const fieldVarieties = new Map<string, number>();
+                  treeTags.forEach(tag => {
+                    if (tag.variety) {
+                      fieldVarieties.set(tag.variety, (fieldVarieties.get(tag.variety) || 0) + 1);
+                    }
+                  });
+
+                  return (
+                    <Card
+                      key={field.id}
+                      className={`p-4 rounded-xl transition-all cursor-pointer hover:shadow-lg ${
+                        selectedFieldId === field.id ? 'border-2 border-green-500 bg-green-50' : 'border border-gray-200 bg-white'
+                      }`}
+                      onClick={() => handleViewField(field)}
+                    >
+                      <div className="flex items-start justify-between mb-2">
+                        <h4 className="font-semibold text-gray-900 text-sm">{field.name}</h4>
+                        <span className={`text-xs px-2 py-1 rounded-full font-medium ${getHealthStatusColor(field.healthStatus)}`}>
+                          {field.healthStatus}
+                        </span>
+                      </div>
+                      <div className="space-y-2 text-sm text-gray-600">
+                        <div className="flex items-center gap-2">
+                          <MapPin className="w-4 h-4" />
+                          <span>{field.location}</span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span>Area: {field.area} kanal</span>
+                          <span className="flex items-center gap-1">
+                            <TreePine className="w-3 h-3" />
+                            {treeTags.length} trees
+                          </span>
+                        </div>
+                        {fieldVarieties.size > 0 && (
+                          <div className="pt-2 border-t border-gray-200">
+                            <p className="text-xs font-medium text-gray-700 mb-1">Varieties:</p>
+                            <div className="flex flex-wrap gap-1">
+                              {Array.from(fieldVarieties.entries()).map(([variety, count]) => (
+                                <span
+                                  key={variety}
+                                  className="inline-flex items-center gap-1 text-xs bg-white px-2 py-0.5 rounded border border-gray-300"
+                                >
+                                  <span
+                                    className="inline-block h-2 w-2 rounded-full"
+                                    style={{ backgroundColor: getVarietyColor(variety) }}
+                                  />
+                                  {count}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </Card>
+                  );
+                })}
               </div>
-            ))
             )}
-          </div>
+          </Card>
         </div>
       </Card>
 
-      {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        {stats.map((stat, index) => (
-          <Card key={index} className="p-6">
-            <div className="flex items-center">
-              <div className={`p-3 rounded-lg ${stat.bgColor}`}>
-                <stat.icon className={`w-6 h-6 ${stat.color}`} />
-              </div>
-              <div className="ml-4">
-                <p className="text-sm font-medium text-gray-600">{stat.title}</p>
-                <p className="text-2xl font-bold text-gray-900">{stat.value}</p>
-              </div>
-            </div>
-          </Card>
-        ))}
-      </div>
-
       {/* Profile Completion Card */}
       {profileCompletion < 100 && (
-        <Card className="p-6 bg-linear-to-r from-green-50 to-blue-50 border-2 border-green-200">
+        <Card className="p-6 bg-gradient-to-r from-green-50 to-blue-50 border-2 border-green-200">
           <div className="flex items-center justify-between">
             <div className="flex items-start space-x-4 flex-1">
               <div className="p-3 bg-white rounded-lg shadow-sm">
@@ -433,7 +695,7 @@ const Dashboard: React.FC = () => {
                   </span>
                 </div>
                 <p className="text-sm text-gray-600 mb-3">
-                  {profileCompletion < 100 
+                  {profileCompletion < 100
                     ? 'Add more information to unlock all features and get personalized recommendations.'
                     : 'Your profile is complete!'}
                 </p>
@@ -443,28 +705,16 @@ const Dashboard: React.FC = () => {
                     <span className="font-medium">{profileCompletion}%</span>
                   </div>
                   <div className="w-full bg-gray-200 rounded-full h-2.5">
-                    <div 
-                      className="bg-linear-to-r from-green-500 to-blue-500 h-2.5 rounded-full transition-all duration-500"
+                    <div
+                      className="bg-gradient-to-r from-green-500 to-blue-500 h-2.5 rounded-full transition-all duration-500"
                       style={{ width: `${profileCompletion}%` }}
                     />
                   </div>
                 </div>
-                <div className="flex flex-wrap gap-2 text-xs">
-                  {profileUser.name && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 className="w-3 h-3" /> Name</span>}
-                  {profileUser.email && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 className="w-3 h-3" /> Email</span>}
-                  {profileUser.phone && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 className="w-3 h-3" /> Phone</span>}
-                  {profileUser.farmName && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 className="w-3 h-3" /> Farm Name</span>}
-                  {profileUser.avatar && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 className="w-3 h-3" /> Photo</span>}
-                  {profileUser.khasraNumber && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 className="w-3 h-3" /> Khasra</span>}
-                  {profileUser.khataNumber && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 className="w-3 h-3" /> Khata</span>}
-                  {!profileUser.avatar && <span className="text-gray-400">Photo</span>}
-                  {!profileUser.khasraNumber && <span className="text-gray-400">Khasra</span>}
-                  {!profileUser.khataNumber && <span className="text-gray-400">Khata</span>}
-                </div>
               </div>
             </div>
             <div>
-              <Button 
+              <Button
                 onClick={() => navigate('/profile')}
                 size="sm"
                 className="whitespace-nowrap"
@@ -475,41 +725,6 @@ const Dashboard: React.FC = () => {
           </div>
         </Card>
       )}
-
-      {/* Charts Section */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card className="p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-gray-900">Production Overview</h3>
-            <TrendingUp className="w-5 h-5 text-green-600" />
-          </div>
-          <div className="h-64 bg-gray-50 rounded-lg flex items-center justify-center">
-            <div className="text-center">
-              <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <TrendingUp className="w-8 h-8 text-green-600" />
-              </div>
-              <p className="text-gray-600">Production Chart</p>
-              <p className="text-sm text-gray-500">Chart visualization would go here</p>
-            </div>
-          </div>
-        </Card>
-
-        <Card className="p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-gray-900">Growth Analytics</h3>
-            <TreePine className="w-5 h-5 text-green-600" />
-          </div>
-          <div className="h-64 bg-gray-50 rounded-lg flex items-center justify-center">
-            <div className="text-center">
-              <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <TreePine className="w-8 h-8 text-green-600" />
-              </div>
-              <p className="text-gray-600">Growth Analytics</p>
-              <p className="text-sm text-gray-500">Analytics visualization would go here</p>
-            </div>
-          </div>
-        </Card>
-      </div>
 
       {/* Recent Activity */}
       <Card className="p-6">
