@@ -7,6 +7,8 @@ import type { User, Field } from '../types';
 import { supabase } from '../lib/supabaseClient';
 import { useAuth } from '../contexts/AuthContext';
 import { orchardService } from '../services/orchardService';
+import { IndianRupee } from 'lucide-react';
+
 
 const Dashboard: React.FC = () => {
   const navigate = useNavigate();
@@ -619,6 +621,28 @@ const Dashboard: React.FC = () => {
           </Card>
         ))}
       </div>
+      <Card className="p-6">
+  <div className="flex items-center justify-between">
+    <div>
+      <h3 className="text-lg font-semibold text-gray-900">
+        Financial Ledger
+      </h3>
+      <p className="text-sm text-gray-500">
+        Track income, expenses & profit
+      </p>
+    </div>
+
+    <Button
+      onClick={() => navigate('/finance')}
+      size="sm"
+      className="flex items-center gap-2"
+    >
+      <IndianRupee className="w-4 h-4" />
+      Open Ledger
+    </Button>
+  </div>
+</Card>
+
 
       {/* Profile Completion Card */}
       {profileCompletion < 100 && (

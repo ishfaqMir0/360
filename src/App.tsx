@@ -7,6 +7,7 @@ import Dashboard from './pages/Dashboard';
 import Fields from './pages/Fields';
 import Profile from './pages/Profile';
 import { useAuth } from './contexts/AuthContext';
+import FinancialLedger from './pages/FinancialLedger';
 
 const RequireAuth = ({ children }: { children: ReactNode }) => {
   const { session, loading } = useAuth();
@@ -44,6 +45,7 @@ function App() {
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="fields" element={<Fields />} />
           <Route path="profile" element={<Profile />} />
+          <Route path="finance" element={<FinancialLedger />} />
         </Route>
       </Routes>
     </Router>

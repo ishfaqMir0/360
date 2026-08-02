@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, MapPin, LogOut, X } from 'lucide-react';
+import { LayoutDashboard, MapPin, IndianRupee, LogOut, X } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 
 interface SidebarProps {
@@ -13,9 +13,11 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
   const { signOut } = useAuth();
 
   const menuItems = [
-    { path: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
-    { path: '/fields', icon: MapPin, label: 'Fields' },
-  ];
+  { path: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+  { path: '/fields', icon: MapPin, label: 'Fields' },
+  { path: '/finance', icon: IndianRupee, label: 'Financial Ledger' },
+];
+
 
   const handleSignOut = async () => {
     await signOut();
